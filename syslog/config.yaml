@@ -17,11 +17,13 @@ options:
   syslog_host: syslog.local
   syslog_port: 514
   syslog_protocol: udp
+  syslog_format: rfc3164
   syslog_ssl: false
   syslog_ssl_verify: true
 schema:
   syslog_host: str
   syslog_port: int
   syslog_protocol: list(udp|tcp)
+  syslog_format: list(rfc3164|rfc5424)
   syslog_ssl: bool
   syslog_ssl_verify: bool
