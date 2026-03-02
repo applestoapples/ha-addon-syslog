@@ -5,6 +5,8 @@ import logging.handlers
 import re
 import socket
 import ssl
+import sys
+from datetime import datetime, timezone
 from os import environ
 
 from systemd import journal
@@ -15,6 +17,7 @@ SYSLOG_PROTO = str(environ["SYSLOG_PROTO"])
 SYSLOG_SSL = True if environ["SYSLOG_SSL"] == "true" else False
 SYSLOG_SSL_VERIFY = True if environ["SYSLOG_SSL_VERIFY"] == "true" else False
 HAOS_HOSTNAME = str(environ["HAOS_HOSTNAME"])
+SYSLOG_FORMAT = str(environ.get("SYSLOG_FORMAT", "rfc3164"))
 
 LOGGING_NAME_TO_LEVEL_MAPPING = logging.getLevelNamesMapping()
 LOGGING_JOURNAL_PRIORITY_TO_LEVEL_MAPPING = [
@@ -35,6 +38,27 @@ CONTAINER_PATTERN_MAPPING = {
     "homeassistant": PATTERN_LOGLEVEL_HA,
     "hassio_supervisor": PATTERN_LOGLEVEL_HA,
 }
+
+# Syslog severity values (RFC 5424 Section 6.2.1)
+JOURNAL_PRIORITY_TO_SYSLOG_SEVERITY = [
+    0,  # 0 - emerg
+    1,  # 1 - alert
+    2,  # 2 - crit
+    3,  # 3 - err
+    4,  # 4 - warning
+    5,  # 5 - notice
+    6,  # 6 - info
+    7,  # 7 - debug
+]
+LOGGING_LEVEL_TO_SYSLOG_SEVERITY = {
+    logging.CRITICAL: 2,
+    logging.ERROR: 3,
+    logging.WARNING: 4,
+    logging.INFO: 6,
+    logging.DEBUG: 7,
+}
+SYSLOG_FACILITY_USER = 1
+ANSI_COLOR_PATTERN = re.compile(r"\x1b\[\d+m")
 
 
 class TlsSysLogHandler(logging.handlers.SysLogHandler):
@@ -60,11 +84,12 @@ class TlsSysLogHandler(logging.handlers.SysLogHandler):
 
         return context.wrap_socket(sock, server_hostname=host)
 
-    def handleError(self, _):
+    def handleError(self, record):
         """
-        Handle errors silent
-        Close failing socket so next emit will try to create a new socket
+        Log errors to stderr instead of silently swallowing them.
+        Close failing socket so next emit will try to create a new socket.
         """
+        print(f"Syslog send error for: {record.getMessage()[:100]}", file=sys.stderr)
         if self.socket is not None:
             self.socket.close()
             self.socket = None
@@ -121,7 +146,8 @@ class TlsSysLogHandler(logging.handlers.SysLogHandler):
 
 def parse_log_level(message: str, container_name: str) -> int:
     """
-    Try to determine logging level from message
+    Try to determine logging level from message.
+
     return: logging.<LEVELNAME> if determined
     return: logging.NOTSET if not determined
     """
@@ -134,66 +160,160 @@ def parse_log_level(message: str, container_name: str) -> int:
     return logging.NOTSET
 
 
-# start journal reader and seek to end of journal
-jr = journal.Reader(path="/var/log/journal")
-jr.this_boot()
-jr.seek_tail()
-jr.get_previous()
-jr.get_next()
+def _format_rfc5424(
+    priority: int, timestamp: datetime, hostname: str, app_name: str, message: str
+) -> str:
+    """Format a syslog message per RFC 5424."""
+    if timestamp.tzinfo is None:
+        timestamp = timestamp.replace(tzinfo=timezone.utc)
+    # RFC 5424 requires ISO 8601 with timezone offset
+    ts_str = timestamp.strftime("%Y-%m-%dT%H:%M:%S.%f%z")
+    # Insert colon in timezone offset (e.g., +0000 -> +00:00) for strict compliance
+    if len(ts_str) >= 5 and ts_str[-5] in "+-" and ts_str[-4:].isdigit():
+        ts_str = ts_str[:-2] + ":" + ts_str[-2:]
+    return f"<{priority}>1 {ts_str} {hostname} {app_name} - - - {message}"
 
-# start logger
-logger = logging.getLogger("")
-logger.setLevel(logging.NOTSET)
 
-if SYSLOG_PROTO.lower() == "udp":
-    socktype = socket.SOCK_DGRAM
-else:
-    socktype = socket.SOCK_STREAM
+def _format_rfc3164(
+    priority: int, timestamp: datetime, hostname: str, app_name: str, message: str
+) -> str:
+    """Format a syslog message per RFC 3164 (BSD syslog)."""
+    # RFC 3164 timestamp: "Mmm dd HH:MM:SS" (space-padded day)
+    ts_str = timestamp.strftime("%b %d %H:%M:%S")
+    return f"<{priority}>{ts_str} {hostname} {app_name}: {message}"
 
-use_ssl = SYSLOG_SSL
-if SYSLOG_SSL and not SYSLOG_SSL_VERIFY:
-    use_ssl = ssl.create_default_context()
-    use_ssl.check_hostname = False
-    use_ssl.verify_mode = ssl.CERT_NONE
 
-syslog_handler = TlsSysLogHandler(
-    address=(SYSLOG_HOST, SYSLOG_PORT), socktype=socktype, ssl=use_ssl
-)
-formatter = logging.Formatter(
-    f"%(asctime)s %(ip)s %(prog)s: %(message)s",
-    defaults={"ip": HAOS_HOSTNAME},
-    datefmt="%b %d %H:%M:%S",
-)
-syslog_handler.setFormatter(formatter)
-logger.addHandler(syslog_handler)
+def _determine_log_level(
+    entry: dict,
+    container_name: str | None,
+    message: str,
+    last_container_log_level: dict[str, int],
+) -> int:
+    """Determine the syslog log level for a journal entry."""
+    if not container_name:
+        return LOGGING_JOURNAL_PRIORITY_TO_LEVEL_MAPPING[
+            entry.get("PRIORITY", 6)
+        ]
+    elif container_name not in CONTAINER_PATTERN_MAPPING:
+        return LOGGING_DEFAULT_LEVEL
+    elif log_level := parse_log_level(message, container_name):
+        last_container_log_level[container_name] = log_level
+        return log_level
+    else:  # use last log level if it could not be parsed (eq. for tracebacks)
+        return last_container_log_level.get(
+            container_name, LOGGING_DEFAULT_LEVEL
+        )
 
-last_container_log_level: dict[str, int] = {}
 
-# wait for new messages in journal
-while True:
-    change = jr.wait(timeout=None)
-    for entry in jr:
-        extra = {"prog": entry.get("SYSLOG_IDENTIFIER")}
+def main():
+    """Main entry point."""
+    # Start journal reader and seek to end of journal
+    #
+    # NOTE: Intentionally NOT calling jr.this_boot() here.
+    # In containers (like HA add-ons), the boot ID from
+    # /proc/sys/kernel/random/boot_id is the container's boot ID, which
+    # doesn't match any boot ID in the host's journal (mounted from
+    # /var/log/journal). this_boot() would silently filter out ALL entries,
+    # causing the add-on to appear working but never forward any logs.
+    jr = journal.Reader(path="/var/log/journal")
+    jr.seek_tail()
+    jr.get_previous()
 
-        # remove shell colors from container messages
-        if (container_name := entry.get("CONTAINER_NAME")) is not None:
-            msg = re.sub(r"\x1b\[\d+m", "", entry.get("MESSAGE"))
-        else:
-            msg = entry.get("MESSAGE")
+    # Determine syslog format
+    if SYSLOG_FORMAT == "rfc5424":
+        format_fn = _format_rfc5424
+    else:
+        format_fn = _format_rfc3164
 
-        # determine syslog level
-        if not container_name:
-            log_level = LOGGING_JOURNAL_PRIORITY_TO_LEVEL_MAPPING[
-                entry.get("PRIORITY", 6)
-            ]
-        elif container_name not in CONTAINER_PATTERN_MAPPING:
-            log_level = LOGGING_DEFAULT_LEVEL
-        elif log_level := parse_log_level(msg, container_name):
-            last_container_log_level[container_name] = log_level
-        else:  # use last log level if it could not be parsed (eq. for tracebacks)
-            log_level = last_container_log_level.get(
-                container_name, LOGGING_DEFAULT_LEVEL
+    # Set up transport
+    if SYSLOG_PROTO.lower() == "udp":
+        socktype = socket.SOCK_DGRAM
+    else:
+        socktype = socket.SOCK_STREAM
+
+    use_ssl = SYSLOG_SSL
+    if SYSLOG_SSL and not SYSLOG_SSL_VERIFY:
+        use_ssl = ssl.create_default_context()
+        use_ssl.check_hostname = False
+        use_ssl.verify_mode = ssl.CERT_NONE
+
+    syslog_handler = TlsSysLogHandler(
+        address=(SYSLOG_HOST, SYSLOG_PORT), socktype=socktype, ssl=use_ssl
+    )
+
+    print(
+        f"Forwarding journal to {SYSLOG_HOST}:{SYSLOG_PORT}/{SYSLOG_PROTO}"
+        f" (format={SYSLOG_FORMAT})",
+        flush=True,
+    )
+
+    last_container_log_level: dict[str, int] = {}
+    sent = 0
+
+    # Main loop: wait for new journal entries and forward them
+    while True:
+        jr.wait(timeout=30)
+        for entry in jr:
+            app_name = entry.get("SYSLOG_IDENTIFIER", "unknown")
+
+            # Remove ANSI color codes from container messages
+            if (container_name := entry.get("CONTAINER_NAME")) is not None:
+                msg = ANSI_COLOR_PATTERN.sub("", entry.get("MESSAGE", ""))
+            else:
+                container_name = None
+                msg = entry.get("MESSAGE", "")
+
+            if not msg:
+                continue
+
+            # Determine log level
+            log_level = _determine_log_level(
+                entry, container_name, msg, last_container_log_level
             )
 
-        # send syslog message
-        logger.log(level=log_level, msg=msg, extra=extra)
+            # Build syslog priority value
+            severity = LOGGING_LEVEL_TO_SYSLOG_SEVERITY.get(log_level, 6)
+            priority = SYSLOG_FACILITY_USER * 8 + severity
+
+            # Get timestamp from journal entry (or use current time)
+            timestamp = entry.get(
+                "_SOURCE_REALTIME_TIMESTAMP",
+                entry.get("__REALTIME_TIMESTAMP", datetime.now(timezone.utc)),
+            )
+            if not isinstance(timestamp, datetime):
+                timestamp = datetime.now(timezone.utc)
+
+            # Format and send
+            syslog_msg = format_fn(
+                priority, timestamp, HAOS_HOSTNAME, app_name, msg
+            )
+
+            try:
+                # Send directly via the handler's socket, bypassing
+                # logging.Handler.emit() to use our own formatting.
+                if syslog_handler.socket is None:
+                    syslog_handler.createSocket()
+                if syslog_handler.socket is not None:
+                    encoded = syslog_msg.encode("utf-8", errors="replace")
+                    if syslog_handler.socktype == socket.SOCK_DGRAM:
+                        syslog_handler.socket.sendto(
+                            encoded, (SYSLOG_HOST, SYSLOG_PORT)
+                        )
+                    else:
+                        # TCP: add newline framing (RFC 6587)
+                        syslog_handler.socket.sendall(encoded + b"\n")
+                    sent += 1
+            except Exception:
+                # Socket error — close and retry on next message
+                syslog_handler.handleError(
+                    logging.LogRecord(
+                        "syslog", log_level, "", 0, msg[:100], (), None
+                    )
+                )
+
+            if sent > 0 and sent % 1000 == 0:
+                print(f"Forwarded {sent} entries", flush=True)
+
+
+if __name__ == "__main__":
+    main()
