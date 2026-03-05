@@ -232,3 +232,71 @@ def test_format_rfc3164_structure():
     result = j2s._format_rfc3164(14, ts, "host", "app", "msg")
     assert result.startswith("<14>")
     assert "host app: msg" in result
+
+
+# ---------------------------------------------------------------------------
+# Datadog grok compatibility: RFC 5424 message body must be parseable
+#
+# The Datadog "homeassistant" pipeline uses this grok rule on the message body:
+#   ha_log %{date("yyyy-MM-dd HH:mm:ss.SSS"):ha.timestamp} %{word:level}
+#          \(%{notSpace:ha.thread}\) \[%{notSpace:ha.logger}\] %{data:message}
+# ---------------------------------------------------------------------------
+
+import re
+
+_GROK_HA_LOG = re.compile(
+    r"^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\.\d{3}"  # timestamp
+    r" (?P<level>\w+)"                                  # level
+    r" \((?P<thread>\S+)\)"                             # (thread)
+    r" \[(?P<logger>\S+)\]"                             # [logger]
+    r" (?P<message>.*)$"                                # message
+)
+
+
+def test_ha_error_message_body_matches_grok():
+    """After ANSI stripping, homeassistant ERROR log body is grok-parseable."""
+    raw = "\x1b[31m2026-03-04 21:23:37.121 ERROR (MainThread) [homeassistant.components.linkplay] Cannot connect\x1b[0m"
+    stripped = j2s.ANSI_COLOR_PATTERN.sub("", raw)
+    m = _GROK_HA_LOG.match(stripped)
+    assert m is not None, f"Grok pattern did not match: {stripped!r}"
+    assert m.group("level") == "ERROR"
+    assert m.group("thread") == "MainThread"
+    assert m.group("logger") == "homeassistant.components.linkplay"
+    assert m.group("message") == "Cannot connect"
+
+
+def test_ha_info_message_body_matches_grok():
+    """After ANSI stripping, INFO log body (with SyncWorker thread) is grok-parseable."""
+    raw = "\x1b[32m2026-03-04 21:23:37.480 INFO (SyncWorker_3) [homeassistant.loader] custom integration\x1b[0m"
+    stripped = j2s.ANSI_COLOR_PATTERN.sub("", raw)
+    m = _GROK_HA_LOG.match(stripped)
+    assert m is not None, f"Grok pattern did not match: {stripped!r}"
+    assert m.group("level") == "INFO"
+    assert m.group("thread") == "SyncWorker_3"
+
+
+def test_ha_warning_message_body_matches_grok():
+    """WARNING level parses correctly (word boundary check)."""
+    raw = "2026-03-04 21:23:37.001 WARNING (MainThread) [homeassistant.setup] Setup failed"
+    m = _GROK_HA_LOG.match(raw)
+    assert m is not None
+    assert m.group("level") == "WARNING"
+
+
+def test_traceback_continuation_does_not_match_grok():
+    """Traceback lines intentionally do NOT match the grok pattern (no timestamp prefix)."""
+    line = "  File /usr/local/lib/python3.13/site-packages/linkplay/utils.py, line 50"
+    assert _GROK_HA_LOG.match(line) is None
+
+
+def test_rfc5424_message_body_is_grok_parseable():
+    """Full round-trip: format_rfc5424 message body extracted and matched by grok."""
+    raw = "\x1b[31m2026-03-04 21:23:37.121 ERROR (MainThread) [homeassistant.components.mqtt] MQTT disconnected\x1b[0m"
+    stripped = j2s.ANSI_COLOR_PATTERN.sub("", raw)
+    ts = datetime(2026, 3, 4, 21, 23, 37, 121000, tzinfo=timezone.utc)
+    syslog_msg = j2s._format_rfc5424(11, ts, "homeassistant", "homeassistant", stripped)
+    # Extract the message body (everything after "- - - ")
+    body = syslog_msg.split(" - - - ", 1)[1]
+    m = _GROK_HA_LOG.match(body)
+    assert m is not None, f"Grok pattern did not match body: {body!r}"
+    assert m.group("level") == "ERROR"
