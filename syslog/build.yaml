@@ -4,5 +4,5 @@ build_from:
 labels:
   org.opencontainers.image.title: "Syslog"
   org.opencontainers.image.description: "Send your HAOS logs to a remote syslog server"
-  org.opencontainers.image.source: "https://github.com/UberKitten/ha-addon-syslog"
+  org.opencontainers.image.source: "https://github.com/applestoapples/ha-addon-syslog"
   org.opencontainers.image.licenses: "Apache License 2.0"
