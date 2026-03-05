@@ -235,6 +235,108 @@ def test_format_rfc3164_structure():
 
 
 # ---------------------------------------------------------------------------
+# _process_entry: multiline buffering behaviour
+# ---------------------------------------------------------------------------
+
+
+def _cap(lst: list):
+    """Return an emit callback that appends (priority, timestamp, app_name, msg) tuples."""
+    return lambda *a: lst.append(a)
+
+
+def _make_entry(msg: str, container: str | None, priority: int | None = 6) -> dict:
+    """Build a minimal journal entry dict."""
+    e: dict = {"SYSLOG_IDENTIFIER": container or "kernel", "MESSAGE": msg}
+    if container:
+        e["CONTAINER_NAME"] = container
+    if priority is not None:
+        e["PRIORITY"] = priority
+    from datetime import timezone
+    e["__REALTIME_TIMESTAMP"] = datetime(2026, 3, 4, 21, 0, 0, tzinfo=timezone.utc)
+    return e
+
+
+def test_process_entry_head_starts_buffer():
+    """A head line (matching level pattern) is buffered, not emitted immediately."""
+    emitted = []
+    buf: dict = {}
+    last: dict = {}
+    msg = "2026-03-04 21:00:00.000 ERROR (MainThread) [homeassistant.foo] bad thing"
+    j2s._process_entry(_make_entry(msg, "homeassistant", 3), last, buf, _cap(emitted))
+    assert len(emitted) == 0, "head line should be buffered, not emitted"
+    assert "homeassistant" in buf
+    assert buf["homeassistant"]["lines"] == [msg]
+
+
+def test_process_entry_continuation_appended_to_buffer():
+    """Continuation lines are appended to the open buffer."""
+    emitted = []
+    buf: dict = {}
+    last: dict = {"homeassistant": logging.ERROR}
+    head = "2026-03-04 21:00:00.000 ERROR (MainThread) [homeassistant.foo] bad thing"
+    cont = "  File /usr/lib/python3.13/foo.py, line 42, in bar"
+    j2s._process_entry(_make_entry(head, "homeassistant", 3), last, buf, _cap(emitted))
+    j2s._process_entry(_make_entry(cont, "homeassistant", 3), last, buf, _cap(emitted))
+    assert len(emitted) == 0
+    assert buf["homeassistant"]["lines"] == [head, cont]
+
+
+def test_process_entry_next_head_flushes_buffer():
+    """A second head line flushes the buffer as one joined message, then starts a new buffer."""
+    emitted = []
+    buf: dict = {}
+    last: dict = {}
+    head1 = "2026-03-04 21:00:00.000 ERROR (MainThread) [homeassistant.foo] error 1"
+    cont  = "  traceback line"
+    head2 = "2026-03-04 21:00:01.000 WARNING (MainThread) [homeassistant.bar] warning"
+
+    j2s._process_entry(_make_entry(head1, "homeassistant", 3), last, buf, _cap(emitted))
+    j2s._process_entry(_make_entry(cont,  "homeassistant", 3), last, buf, _cap(emitted))
+    j2s._process_entry(_make_entry(head2, "homeassistant", 4), last, buf, _cap(emitted))
+
+    # First buffer flushed as one event
+    assert len(emitted) == 1
+    flushed_msg = emitted[0][3]  # (priority, timestamp, app_name, msg)
+    assert head1 in flushed_msg
+    assert cont in flushed_msg
+    assert flushed_msg == f"{head1}\n{cont}"
+
+    # Second head is now buffered
+    assert buf["homeassistant"]["lines"] == [head2]
+
+
+def test_process_entry_non_pattern_container_emitted_immediately():
+    """Containers not in CONTAINER_PATTERN_MAPPING are always emitted immediately."""
+    emitted = []
+    buf: dict = {}
+    last: dict = {}
+    msg = '[INFO] 127.0.0.1 "PTR IN local."'
+    j2s._process_entry(_make_entry(msg, "hassio_dns", 6), last, buf, _cap(emitted))
+    assert len(emitted) == 1
+    assert buf == {}
+
+
+def test_process_entry_orphaned_continuation_emitted_immediately():
+    """A continuation with no open buffer (e.g. after restart) is sent as-is."""
+    emitted = []
+    buf: dict = {}
+    last: dict = {}
+    cont = "  File /usr/lib/python3.13/foo.py, line 42"
+    j2s._process_entry(_make_entry(cont, "homeassistant", 3), last, buf, _cap(emitted))
+    assert len(emitted) == 1
+    assert buf == {}
+
+
+def test_process_entry_system_unit_emitted_immediately():
+    """Non-container (system unit) entries are emitted without buffering."""
+    emitted = []
+    buf: dict = {}
+    last: dict = {}
+    j2s._process_entry(_make_entry("kernel message", None, 6), last, buf, _cap(emitted))
+    assert len(emitted) == 1
+
+
+# ---------------------------------------------------------------------------
 # Datadog grok compatibility: RFC 5424 message body must be parseable
 #
 # The Datadog "homeassistant" pipeline uses this grok rule on the message body:

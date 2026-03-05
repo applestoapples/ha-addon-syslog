@@ -6,6 +6,7 @@ import re
 import socket
 import ssl
 import sys
+from collections.abc import Callable
 from datetime import datetime, timezone
 from os import environ
 
@@ -205,6 +206,75 @@ def _determine_log_level(
         )
 
 
+# How long (seconds) a multiline buffer can sit unflushed before being sent.
+# Handles the case where a traceback is the last thing logged before silence.
+MULTILINE_TIMEOUT = 30
+
+
+def _process_entry(
+    entry: dict,
+    last_container_log_level: dict[str, int],
+    multiline_buf: dict[str, dict],
+    emit: "Callable[[int, datetime, str, str], None]",
+) -> None:
+    """Process one journal entry: buffer multiline messages or emit immediately.
+
+    For containers in CONTAINER_PATTERN_MAPPING (homeassistant, hassio_supervisor):
+    - Lines that carry a level marker ("head" lines) flush the previous buffer
+      for that container and start a new one.
+    - Continuation lines (tracebacks, extra context) are appended to the buffer.
+    - When the buffer is flushed the lines are joined with newlines and sent as
+      a single syslog message, preserving the traceback as one log event.
+
+    All other containers and system units are emitted immediately.
+    """
+    app_name = entry.get("SYSLOG_IDENTIFIER", "unknown")
+
+    # Remove ANSI color codes from container messages
+    if (container_name := entry.get("CONTAINER_NAME")) is not None:
+        msg = ANSI_COLOR_PATTERN.sub("", entry.get("MESSAGE", ""))
+    else:
+        container_name = None
+        msg = entry.get("MESSAGE", "")
+
+    if not msg:
+        return
+
+    log_level = _determine_log_level(entry, container_name, msg, last_container_log_level)
+    severity = LOGGING_LEVEL_TO_SYSLOG_SEVERITY.get(log_level, 6)
+    priority = SYSLOG_FACILITY_USER * 8 + severity
+
+    timestamp = entry.get(
+        "_SOURCE_REALTIME_TIMESTAMP",
+        entry.get("__REALTIME_TIMESTAMP", datetime.now(timezone.utc)),
+    )
+    if not isinstance(timestamp, datetime):
+        timestamp = datetime.now(timezone.utc)
+
+    if container_name in CONTAINER_PATTERN_MAPPING:
+        is_head = bool(parse_log_level(msg, container_name))
+        if is_head:
+            # Flush any buffered lines for this container, then start a new buffer
+            if container_name in multiline_buf:
+                buf = multiline_buf.pop(container_name)
+                emit(buf["priority"], buf["timestamp"], buf["app_name"],
+                     "\n".join(buf["lines"]))
+            multiline_buf[container_name] = {
+                "priority": priority,
+                "timestamp": timestamp,
+                "app_name": app_name,
+                "lines": [msg],
+            }
+        elif container_name in multiline_buf:
+            # Continuation line — append to the open buffer
+            multiline_buf[container_name]["lines"].append(msg)
+        else:
+            # No buffer open (e.g., resumed mid-traceback after restart) — send as-is
+            emit(priority, timestamp, app_name, msg)
+    else:
+        emit(priority, timestamp, app_name, msg)
+
+
 def main():
     """Main entry point."""
     # Start journal reader and seek to end of journal
@@ -248,71 +318,46 @@ def main():
     )
 
     last_container_log_level: dict[str, int] = {}
+    multiline_buf: dict[str, dict] = {}
     sent = 0
+
+    def emit(priority: int, timestamp: datetime, app_name: str, msg: str) -> None:
+        nonlocal sent
+        syslog_msg = format_fn(priority, timestamp, HAOS_HOSTNAME, app_name, msg)
+        try:
+            if syslog_handler.socket is None:
+                syslog_handler.createSocket()
+            if syslog_handler.socket is not None:
+                encoded = syslog_msg.encode("utf-8", errors="replace")
+                if syslog_handler.socktype == socket.SOCK_DGRAM:
+                    syslog_handler.socket.sendto(encoded, (SYSLOG_HOST, SYSLOG_PORT))
+                else:
+                    # TCP: add newline framing (RFC 6587)
+                    syslog_handler.socket.sendall(encoded + b"\n")
+                sent += 1
+        except Exception:
+            syslog_handler.handleError(
+                logging.LogRecord("syslog", priority, "", 0, msg[:100], (), None)
+            )
+        if sent > 0 and sent % 1000 == 0:
+            print(f"Forwarded {sent} entries", flush=True)
 
     # Main loop: wait for new journal entries and forward them
     while True:
         jr.wait(timeout=30)
+
+        # Flush multiline buffers that have been waiting too long (e.g. last
+        # log before silence — no subsequent head line will arrive to flush them)
+        now = datetime.now(timezone.utc)
+        for cname in list(multiline_buf):
+            age = (now - multiline_buf[cname]["timestamp"]).total_seconds()
+            if age >= MULTILINE_TIMEOUT:
+                buf = multiline_buf.pop(cname)
+                emit(buf["priority"], buf["timestamp"], buf["app_name"],
+                     "\n".join(buf["lines"]))
+
         for entry in jr:
-            app_name = entry.get("SYSLOG_IDENTIFIER", "unknown")
-
-            # Remove ANSI color codes from container messages
-            if (container_name := entry.get("CONTAINER_NAME")) is not None:
-                msg = ANSI_COLOR_PATTERN.sub("", entry.get("MESSAGE", ""))
-            else:
-                container_name = None
-                msg = entry.get("MESSAGE", "")
-
-            if not msg:
-                continue
-
-            # Determine log level
-            log_level = _determine_log_level(
-                entry, container_name, msg, last_container_log_level
-            )
-
-            # Build syslog priority value
-            severity = LOGGING_LEVEL_TO_SYSLOG_SEVERITY.get(log_level, 6)
-            priority = SYSLOG_FACILITY_USER * 8 + severity
-
-            # Get timestamp from journal entry (or use current time)
-            timestamp = entry.get(
-                "_SOURCE_REALTIME_TIMESTAMP",
-                entry.get("__REALTIME_TIMESTAMP", datetime.now(timezone.utc)),
-            )
-            if not isinstance(timestamp, datetime):
-                timestamp = datetime.now(timezone.utc)
-
-            # Format and send
-            syslog_msg = format_fn(
-                priority, timestamp, HAOS_HOSTNAME, app_name, msg
-            )
-
-            try:
-                # Send directly via the handler's socket, bypassing
-                # logging.Handler.emit() to use our own formatting.
-                if syslog_handler.socket is None:
-                    syslog_handler.createSocket()
-                if syslog_handler.socket is not None:
-                    encoded = syslog_msg.encode("utf-8", errors="replace")
-                    if syslog_handler.socktype == socket.SOCK_DGRAM:
-                        syslog_handler.socket.sendto(
-                            encoded, (SYSLOG_HOST, SYSLOG_PORT)
-                        )
-                    else:
-                        # TCP: add newline framing (RFC 6587)
-                        syslog_handler.socket.sendall(encoded + b"\n")
-                    sent += 1
-            except Exception:
-                # Socket error — close and retry on next message
-                syslog_handler.handleError(
-                    logging.LogRecord(
-                        "syslog", log_level, "", 0, msg[:100], (), None
-                    )
-                )
-
-            if sent > 0 and sent % 1000 == 0:
-                print(f"Forwarded {sent} entries", flush=True)
+            _process_entry(entry, last_container_log_level, multiline_buf, emit)
 
 
 if __name__ == "__main__":

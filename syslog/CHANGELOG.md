@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.5.2
+
+- Aggregate multiline journal entries (tracebacks) into a single syslog message
+
 ## 0.5.1
 
 - Default syslog format changed to RFC 5424
