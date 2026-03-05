@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.5.1
+
+- Default syslog format changed to RFC 5424
+- Default image registry switched to ghcr.io/applestoapples
+
 ## 0.5.0
 
 - Fix journal reader in containers (boot ID mismatch with host journal)
