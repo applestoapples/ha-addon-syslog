@@ -1,3 +1,7 @@
+## 0.5.1091
+
+- Rebuilt and tested both architectures with fresh Bookworm base and package layers.
+
 # Changelog
 
 ## 0.5.2
