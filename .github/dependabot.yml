@@ -1,9 +1,16 @@
 version: 2
 updates:
   - package-ecosystem: github-actions
-    directory: "/"
+    directory: /
     schedule:
-      interval: monthly
+      interval: weekly
     groups:
       gh-actions:
-        patterns: ["*"]
+        patterns: ['*']
+  - package-ecosystem: docker
+    directory: /syslog
+    schedule:
+      interval: weekly
+    ignore:
+      - dependency-name: ghcr.io/home-assistant/amd64-base-debian
+        update-types: [version-update:semver-major]

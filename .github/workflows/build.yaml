@@ -2,76 +2,128 @@ name: Build add-on
 
 on:
   workflow_dispatch:
+  schedule:
+    - cron: '23 8 * * 1'
   pull_request:
-    branches: ["main"]
+    branches: [main]
   push:
-    branches: ["main"]
-    tags: ["*"]
+    branches: [main]
+    paths-ignore: ['**.md']
+
+permissions:
+  contents: read
+
+concurrency:
+  group: syslog-release-${{ github.event.pull_request.number || 'main' }}
+  cancel-in-progress: false
 
 jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@1af3b93b6815bc44a9784bd300feb67ff0d1eeb3 # v6.0.0
+      - id: version
+        name: Allocate immutable maintenance version
+        run: |
+          python3 - <<'PY'
+          import os, re
+          from pathlib import Path
+          current = re.search(r'^version: "(\d+)\.(\d+)\.(\d+)"', Path('syslog/config.yaml').read_text(), re.M)
+          if not current:
+              raise SystemExit('Expected numeric major.minor.patch version')
+          major, minor, patch = map(int, current.groups())
+          version = f'{major}.{minor}.{max(patch + 1, 1000 + int(os.environ["GITHUB_RUN_NUMBER"]) * 10 + int(os.environ["GITHUB_RUN_ATTEMPT"]))}'
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as output:
+              output.write(f'version={version}\n')
+          PY
   test:
     runs-on: ubuntu-latest
-    name: Run unit tests
     steps:
-      - name: Check out repository
-        uses: actions/checkout@v6.0.0
-
-      - name: Set up Python
-        uses: actions/setup-python@v5
+      - uses: actions/checkout@1af3b93b6815bc44a9784bd300feb67ff0d1eeb3 # v6.0.0
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with:
-          python-version: "3.12"
-
-      - name: Install pytest
-        run: pip install pytest
-
-      - name: Run tests
-        run: python -m pytest syslog/tests/ -v
-
+          python-version: '3.12'
+      - run: pip install pytest
+      - run: python -m pytest syslog/tests/ -v
   build:
-    needs: test
+    needs: [prepare, test]
     permissions:
       contents: read
       packages: write
     runs-on: ${{ matrix.arch == 'aarch64' && 'ubuntu-24.04-arm' || 'ubuntu-latest' }}
-    name: Build ${{ matrix.arch }} syslog add-on
     strategy:
+      fail-fast: false
       matrix:
-        arch: ["aarch64", "amd64"]
-
+        arch: [aarch64, amd64]
+    env:
+      IMAGE: ghcr.io/applestoapples/${{ matrix.arch }}-ha-addon-syslog
+      VERSION: ${{ needs.prepare.outputs.version }}
+      ARCH: ${{ matrix.arch }}
     steps:
-      - name: Check out repository
-        uses: actions/checkout@v6.0.0
-
-      - name: Get information
-        id: info
-        uses: home-assistant/actions/helpers/info@master
-        with:
-          path: "./syslog"
-
-      - name: Set build arguments
+      - uses: actions/checkout@1af3b93b6815bc44a9784bd300feb67ff0d1eeb3 # v6.0.0
+      - name: Build fresh image
         run: |
-          if [[ "${{ github.event_name }}" == "pull_request" ]]; then
-              echo "TEST_FLAG=--test" >> $GITHUB_ENV;
-          fi
-          if [[ "${{ github.event_name }}" == "push" ]] && [[ "${{ github.ref }}" == "refs/heads/main" ]]; then
-              echo "VERSION_FLAG=--version dev --no-latest" >> $GITHUB_ENV;
-          fi
-
-      - name: Login to GitHub Container Registry
-        if: github.event_name == 'push'
-        uses: docker/login-action@v3.6.0
+          BASE=$(sed -n 's/^ARG BUILD_FROM=//p' syslog/Dockerfile)
+          BASE=${BASE/amd64-/${ARCH}-}
+          docker pull "$BASE"
+          BASE_DIGEST=$(docker image inspect "$BASE" --format '{{index .RepoDigests 0}}')
+          docker build --pull --no-cache --build-arg "BUILD_FROM=$BASE_DIGEST" \
+            --label "io.hass.version=$VERSION" --label "io.hass.type=addon" \
+            --label "io.hass.arch=$ARCH" --label "io.hass.name=Syslog" \
+            --label "org.opencontainers.image.version=$VERSION" \
+            --label "org.opencontainers.image.revision=$GITHUB_SHA" \
+            --label "org.opencontainers.image.source=https://github.com/$GITHUB_REPOSITORY" \
+            --label "org.opencontainers.image.base.name=$BASE" \
+            --label "org.opencontainers.image.base.digest=${BASE_DIGEST#*@}" \
+            --label "org.opencontainers.image.created=$(date -u +%FT%TZ)" \
+            -t "$IMAGE:$VERSION" syslog
+      - name: Smoke test built artifact
+        run: |
+          docker run --rm --entrypoint /bin/bash "$IMAGE:$VERSION" -c 'test -x /run.sh && bash -n /run.sh && bash -n /bashio_info.sh && python3 -c "from systemd import journal; import py_compile; py_compile.compile(\"/journal2syslog.py\", doraise=True)"'
+      - uses: docker/login-action@5e57cd118135c172c3672efd75eb46360885c0ef # v3.6.0
+        if: github.event_name != 'pull_request'
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Build syslog add-on
-        uses: home-assistant/builder@2025.11.0
+      - name: Publish exact tested artifact
+        if: github.event_name != 'pull_request'
+        run: |
+          docker push "$IMAGE:$VERSION"
+          docker tag "$IMAGE:$VERSION" "$IMAGE:latest"
+          docker push "$IMAGE:latest"
+          echo "Published $IMAGE:$VERSION" >> "$GITHUB_STEP_SUMMARY"
+  release:
+    name: Publish HA catalog
+    if: github.event_name != 'pull_request'
+    needs: [prepare, build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      VERSION: ${{ needs.prepare.outputs.version }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@1af3b93b6815bc44a9784bd300feb67ff0d1eeb3 # v6.0.0
         with:
-          image: ${{ matrix.arch == 'aarch64' && 'aarch64' || 'amd64' }}
-          args: |
-            ${{ env.TEST_FLAG }} \
-            ${{ env.VERSION_FLAG }} \
-            --${{ matrix.arch }} \
-            --target /data/syslog \
-            --addon
+          fetch-depth: 0
+      - name: Advertise only fully published images
+        run: |
+          python3 - <<'PY'
+          import os, re
+          from pathlib import Path
+          version = os.environ['VERSION']
+          config = Path('syslog/config.yaml')
+          config.write_text(re.sub(r'^version: .*$', f'version: "{version}"', config.read_text(), count=1, flags=re.M))
+          changelog = Path('syslog/CHANGELOG.md')
+          changelog.write_text(f'## {version}\n\n- Rebuilt and tested both architectures with fresh Bookworm base and package layers.\n\n' + changelog.read_text())
+          PY
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add syslog/config.yaml syslog/CHANGELOG.md
+          git commit -m "Release Syslog $VERSION [skip ci]"
+          # A concurrent main change causes a visible failure, never a forced update.
+          git push origin HEAD:main
+          gh release create "$VERSION" --target "$(git rev-parse HEAD)" --title "Syslog $VERSION" --notes "Weekly-compatible maintenance release. Both architectures rebuilt with fresh bases and package layers; unit tests and artifact smoke tests passed."
