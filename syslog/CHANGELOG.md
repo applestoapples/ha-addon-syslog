@@ -1,3 +1,7 @@
+## 0.5.1111
+
+- Rebuilt and tested amd64 with fresh Bookworm base and package layers.
+
 ## 0.5.1101
 
 - Rebuilt and tested both architectures with fresh Bookworm base and package layers.
