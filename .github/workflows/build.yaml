@@ -52,21 +52,16 @@ jobs:
     permissions:
       contents: read
       packages: write
-    runs-on: ${{ matrix.arch == 'aarch64' && 'ubuntu-24.04-arm' || 'ubuntu-latest' }}
-    strategy:
-      fail-fast: false
-      matrix:
-        arch: [aarch64, amd64]
+    runs-on: ubuntu-latest
     env:
-      IMAGE: ghcr.io/applestoapples/${{ matrix.arch }}-ha-addon-syslog
+      IMAGE: ghcr.io/applestoapples/amd64-ha-addon-syslog
       VERSION: ${{ needs.prepare.outputs.version }}
-      ARCH: ${{ matrix.arch }}
+      ARCH: amd64
     steps:
       - uses: actions/checkout@1af3b93b6815bc44a9784bd300feb67ff0d1eeb3 # v6.0.0
       - name: Build fresh image
         run: |
           BASE=$(sed -n 's/^ARG BUILD_FROM=//p' syslog/Dockerfile)
-          BASE=${BASE/amd64-/${ARCH}-}
           docker pull "$BASE"
           BASE_DIGEST=$(docker image inspect "$BASE" --format '{{index .RepoDigests 0}}')
           docker build --pull --no-cache --build-arg "BUILD_FROM=$BASE_DIGEST" \
@@ -118,7 +113,7 @@ jobs:
           config = Path('syslog/config.yaml')
           config.write_text(re.sub(r'^version: .*$', f'version: "{version}"', config.read_text(), count=1, flags=re.M))
           changelog = Path('syslog/CHANGELOG.md')
-          changelog.write_text(f'## {version}\n\n- Rebuilt and tested both architectures with fresh Bookworm base and package layers.\n\n' + changelog.read_text())
+          changelog.write_text(f'## {version}\n\n- Rebuilt and tested amd64 with fresh Bookworm base and package layers.\n\n' + changelog.read_text())
           PY
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
@@ -126,4 +121,4 @@ jobs:
           git commit -m "Release Syslog $VERSION [skip ci]"
           # A concurrent main change causes a visible failure, never a forced update.
           git push origin HEAD:main
-          gh release create "$VERSION" --target "$(git rev-parse HEAD)" --title "Syslog $VERSION" --notes "Weekly-compatible maintenance release. Both architectures rebuilt with fresh bases and package layers; unit tests and artifact smoke tests passed."
+          gh release create "$VERSION" --target "$(git rev-parse HEAD)" --title "Syslog $VERSION" --notes "Weekly-compatible maintenance release. The amd64 image rebuilt with fresh bases and package layers; unit tests and artifact smoke tests passed."

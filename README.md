@@ -1,6 +1,6 @@
 # Syslog Home Assistant AddOn (applestoapples fork)
 
-![Supports aarch64 Architecture][aarch64-shield] ![Supports amd64 Architecture][amd64-shield]
+![Supports amd64 Architecture][amd64-shield]
 
 Fork of [UberKitten/ha-addon-syslog](https://github.com/UberKitten/ha-addon-syslog) (itself a fork of [mib1185/ha-addon-syslog](https://github.com/mib1185/ha-addon-syslog)).
 
@@ -18,12 +18,11 @@ Or use the *My Home Assistant* link:
 
 See the add-on [docs](syslog/DOCS.md).
 
-[aarch64-shield]: https://img.shields.io/badge/aarch64-yes-green.svg
 [amd64-shield]: https://img.shields.io/badge/amd64-yes-green.svg
 
 ## Maintenance and automatic updates
 
-GitHub Actions rebuilds both supported architectures every Monday at 08:23 UTC
+GitHub Actions rebuilds the supported amd64 architecture every Monday at 08:23 UTC
 (04:23 Eastern daylight time / 03:23 Eastern standard time), and on main changes.
 Every build pulls the current Home Assistant Bookworm base and refreshes package
 layers without cache. Unit tests and a smoke test of each resulting image must pass
@@ -32,13 +31,14 @@ in OCI labels. Application behavior and the Debian release remain unchanged.
 
 A successful publication gets a unique numeric patch version (run number and attempt
 plus a monotonic floor), immutable version tags, and `latest` tracking tags. Only
-after both images are published does the workflow update `syslog/config.yaml` and
+after the amd64 image is published does the workflow update `syslog/config.yaml` and
 create a GitHub release. Home Assistant Supervisor detects the changed version and
 uses its native per-app Auto update setting. Unraid's Docker updater does not manage
 apps inside the HA VM. Keep rollback backups and previous version tags.
 
 Dependabot checks GitHub Actions and the Dockerfile base weekly. The Dockerfile's
-amd64 default is the canonical base track; CI substitutes the matching aarch64 name.
+amd64 default is the canonical base track.
+
 Base-release migration PRs require review; no automatic merge is configured.
 Fresh builds follow new digests on Bookworm even when no Dependabot PR is needed.
 `syslog/build.yaml` must remain aligned if the base branch changes. A successful
